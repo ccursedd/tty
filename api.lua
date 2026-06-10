@@ -19,6 +19,7 @@ local mevreanim = {
 		clone_died = nil;
 		clone_char_child_removed = nil;
         animation_hb = nil;
+        neck_transform_connection = nil; -- Added for neck transform
 	};
 	real_chars = {};
 	callbacks = {
@@ -37,6 +38,7 @@ local mevreanim = {
         };
         original_motor_c0s = {};
         joints = {};
+        neck_transform_enabled = false; -- Flag to enable transform-based neck
     };
 };
 
@@ -131,7 +133,65 @@ local fire_remote = function(remote, is_local, ...)
 	end;
 end;
 
---- Stops any currently playing animation.
+-- New function to compute neck rotation from current animation
+local computeNeckRotation = function()
+    -- This function should return the CFrame offset for the neck
+    -- Based on your animation data
+    local neck_motor = mevreanim.animation.joints["Neck"]; -- or "Head" depending on your rig
+    if neck_motor and mevreanim.animation.original_motor_c0s[neck_motor] then
+        local original_c0 = mevreanim.animation.original_motor_c0s[neck_motor];
+        local current_c0 = neck_motor.C0;
+        -- Return the relative rotation from original
+        return original_c0:Inverse() * current_c0;
+    end
+    return CFrame.new();
+end;
+
+-- Function to setup transform-based neck control
+local setupNeckTransform = function(character)
+    local head = character:FindFirstChild("Head");
+    local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso");
+    local neck = character:FindFirstChild("Neck");
+    
+    if not neck then
+        -- Create Neck if it doesn't exist
+        if head and torso then
+            neck = Instance.new("Motor6D");
+            neck.Name = "Neck";
+            neck.Part0 = torso;
+            neck.Part1 = head;
+            neck.C0 = CFrame.new(0, 1.5, 0); -- Default position, adjust as needed
+            neck.C1 = CFrame.new(0, 0.5, 0);
+            neck.Parent = torso;
+        else
+            return;
+        end
+    end
+    
+    -- Disconnect existing connection if any
+    if mevreanim.connections.neck_transform_connection then
+        mevreanim.connections.neck_transform_connection:Disconnect();
+        mevreanim.connections.neck_transform_connection = nil;
+    end
+    
+    -- Store the animator for throttling check
+    local humanoid = character:FindFirstChildOfClass("Humanoid");
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator");
+    
+    if animator then
+        mevreanim.connections.neck_transform_connection = mevreanim.services.run_service.PreSimulation:Connect(function()
+            -- run after Animation applies the Transform
+            if not animator.EvaluationThrottled then
+                -- skip this frame if Animation is throttled by LOD
+                local neck_rotation = computeNeckRotation();
+                neck.Transform = neck_rotation * neck.Transform;
+            end
+        end);
+        mevreanim.animation.neck_transform_enabled = true;
+    end
+end;
+
+-- Modified stop_animation to handle neck transform cleanup
 API.stop_animation = function()
     if not mevreanim.animation.state.is_playing then return end;
     
@@ -142,6 +202,13 @@ API.stop_animation = function()
         mevreanim.connections.animation_hb = nil;
     end
 
+    -- Disable neck transform connection if enabled
+    if mevreanim.connections.neck_transform_connection then
+        mevreanim.connections.neck_transform_connection:Disconnect();
+        mevreanim.connections.neck_transform_connection = nil;
+        mevreanim.animation.neck_transform_enabled = false;
+    end
+
     local player = get_local_player();
     if typeof(player) == "string" then return player end;
 
@@ -150,6 +217,10 @@ API.stop_animation = function()
         for motor, orig_c0 in pairs(mevreanim.animation.original_motor_c0s) do
             if motor and motor.Parent then
                 motor.C0 = orig_c0;
+                -- Also reset Transform if using transform method
+                if motor.Name == "Neck" and mevreanim.animation.neck_transform_enabled then
+                    motor.Transform = CFrame.new();
+                end
             end
         end
         local clone_animate_script = clone_char:FindFirstChild("Animate")
@@ -167,10 +238,193 @@ API.stop_animation = function()
 	end
 end;
 
---- Toggles the Reanimate state.
--- @param bool (boolean) - true to enable reanimation, false to disable.
--- @param remote (Instance) [optional] - A RemoteEvent or RemoteFunction to fire.
--- @param args (table) [optional] - Arguments for the remote.
+-- Modified play_animation to optionally use transform-based neck
+API.play_animation = function(url, speed, use_transform_neck)
+    if not mevreanim.flags.reanimated then
+        return "Cannot play animation, not reanimated.";
+    end
+    
+    local player = get_local_player();
+    if typeof(player) == "string" then return player end;
+    
+    local clone_char = API.get_clone(player);
+    if not clone_char then 
+        return "Cannot play animation, clone character not found.";
+    end
+    
+    if mevreanim.animation.state.is_playing and mevreanim.animation.state.current_url == url then
+        API.stop_animation();
+        return;
+    end
+    
+    API.stop_animation();
+    
+    local clone_anim_controller = clone_char:FindFirstChildOfClass("Humanoid") or clone_char:FindFirstChildOfClass("AnimationController")
+    if clone_anim_controller then
+        for _, track in ipairs(clone_anim_controller:GetPlayingAnimationTracks()) do
+            track:Stop()
+        end
+    end
+    local clone_animate_script = clone_char:FindFirstChild("Animate")
+    if clone_animate_script then
+        clone_animate_script.Enabled = false
+    end
+    
+    local anim = mevreanim.animation;
+    anim.state.speed = tonumber(speed) or 1.0;
+
+    local keyframe_data = anim.cache[url];
+    if not keyframe_data then
+        local success, response = pcall(game.HttpGet, game, url);
+		if not success then return "Animation Error: Failed to fetch URL." end
+
+        local loaded_fn, err = loadstring(response);
+		if not loaded_fn then return "Animation Error: Invalid script from URL. " .. tostring(err) end;
+        
+		local success, data = pcall(loaded_fn)
+		if not success then return "Animation Error: Script from URL failed to execute. " .. tostring(data) end
+        keyframe_data = data;
+
+        if typeof(keyframe_data) ~= "table" then return "Animation Error: Script from URL did not return a table." end;
+        
+        anim.cache[url] = keyframe_data;
+    end
+
+    local keyframes = keyframe_data[next(keyframe_data)];
+	if not keyframes or #keyframes == 0 then
+		return "No keyframes array found for animation URL: " .. url;
+	end
+
+    anim.state.keyframes = keyframes;
+
+    table.clear(anim.joints);
+    table.clear(anim.original_motor_c0s);
+    for _, descendant in ipairs(clone_char:GetDescendants()) do
+        if descendant:IsA("Motor6D") then
+            anim.joints[descendant.Part1.Name] = descendant;
+            anim.original_motor_c0s[descendant] = descendant.C0;
+        end
+    end
+
+    -- Setup transform-based neck if requested
+    if use_transform_neck then
+        setupNeckTransform(clone_char);
+    end
+
+    anim.state.is_playing = true;
+    anim.state.current_url = url;
+    anim.state.total_duration = keyframes[#keyframes].Time;
+	if anim.state.total_duration <= 0 then API.stop_animation(); return end;
+	
+	anim.state.elapsed_time = 0;
+	
+	if mevreanim.callbacks.on_play then
+		pcall(mevreanim.callbacks.on_play, anim.state.current_url)
+	end
+	
+	mevreanim.connections.animation_hb = mevreanim.services.run_service.Heartbeat:Connect(function(deltaTime)
+		if not anim.state.is_playing then return end;
+		
+		anim.state.elapsed_time = (anim.state.elapsed_time + (deltaTime * anim.state.speed)) % anim.state.total_duration;
+		
+		local current_frame, next_frame;
+		for i = 1, #anim.state.keyframes - 1 do
+			if anim.state.elapsed_time >= anim.state.keyframes[i].Time and anim.state.elapsed_time < anim.state.keyframes[i+1].Time then
+				current_frame = anim.state.keyframes[i];
+				next_frame = anim.state.keyframes[i+1];
+				break;
+			end
+		end
+		if not current_frame then
+			current_frame = anim.state.keyframes[#anim.state.keyframes];
+			next_frame = anim.state.keyframes[1];
+		end
+		
+		local frame_duration = next_frame.Time - current_frame.Time;
+		if frame_duration <= 0 then frame_duration = anim.state.total_duration end;
+
+		local alpha = (frame_duration > 0) and (anim.state.elapsed_time - current_frame.Time) / frame_duration or 0;
+		alpha = math.clamp(alpha, 0, 1)
+
+		for partName, pose_cframe in pairs(current_frame.Data) do
+            local motor = anim.joints[partName];
+            if motor and anim.original_motor_c0s[motor] then
+                local original_c0 = anim.original_motor_c0s[motor];
+                local next_pose_cframe = next_frame.Data and next_frame.Data[partName];
+
+                if next_pose_cframe then
+                    -- For neck with transform enabled, we handle differently
+                    if partName == "Neck" and mevreanim.animation.neck_transform_enabled then
+                        -- Don't modify C0 directly, let the transform system handle it
+                        -- Just store the target rotation for computeNeckRotation to use
+                        local target_rotation = original_c0 * pose_cframe:Lerp(next_pose_cframe, alpha);
+                        motor.C0 = original_c0; -- Keep original C0, Transform will be applied
+                        -- Store target in a table for computeNeckRotation to access
+                        if not motor._targetTransform then
+                            motor._targetTransform = target_rotation;
+                        else
+                            motor._targetTransform = target_rotation;
+                        end
+                    else
+                        motor.C0 = original_c0 * pose_cframe:Lerp(next_pose_cframe, alpha);
+                    end
+                else
+                    motor.C0 = original_c0 * pose_cframe;
+                end
+            end
+		end
+	end);
+end;
+
+-- Update computeNeckRotation to use stored target
+local function computeNeckRotation()
+    local neck_motor = mevreanim.animation.joints["Neck"];
+    if neck_motor and neck_motor._targetTransform then
+        local original_c0 = mevreanim.animation.original_motor_c0s[neck_motor];
+        if original_c0 then
+            return original_c0:Inverse() * neck_motor._targetTransform;
+        end
+    end
+    return CFrame.new();
+end
+
+-- Rest of your API functions remain the same...
+API.set_animation_speed = function(speed)
+    mevreanim.animation.state.speed = tonumber(speed) or 1.0;
+end;
+
+API.on_animation_play = function(callback)
+	if type(callback) == "function" then
+		mevreanim.callbacks.on_play = callback
+	end
+end
+
+API.on_animation_stop = function(callback)
+	if type(callback) == "function" then
+		mevreanim.callbacks.on_stop = callback
+	end
+end
+
+API.is_animation_playing = function()
+	return mevreanim.animation.state.is_playing, mevreanim.animation.state.current_url
+end
+
+API.is_reanimated = function()
+	return mevreanim.flags.reanimated;
+end;
+
+API.get_clone = function(player)
+	player = player or get_local_player();
+	if typeof(player) == "string" then return nil end;
+	return mevreanim.clones[player];
+end;
+
+API.get_real_character = function(player)
+	player = player or get_local_player();
+	if typeof(player) == "string" then return nil end;
+	return mevreanim.real_chars[player];
+end;
+
 API.reanimate = function(bool, remote, args)
 	if bool ~= true and bool ~= false then
 		return ("bad argument #1 to 'reanimate' (boolean expected, got %s)"):format(typeof(bool));
@@ -320,179 +574,6 @@ API.reanimate = function(bool, remote, args)
 		end;
 		mevreanim.flags.reanimated = false;
 	end;
-end;
-
---- Plays an animation on the reanimated character.
--- @param url (string) - The URL of the keyframe script.
--- @param speed (number) [optional] - The playback speed multiplier. Defaults to 1.
-API.play_animation = function(url, speed)
-    if not mevreanim.flags.reanimated then
-        return "Cannot play animation, not reanimated.";
-    end
-    
-    local player = get_local_player();
-    if typeof(player) == "string" then return player end;
-    
-    local clone_char = API.get_clone(player);
-    if not clone_char then 
-        return "Cannot play animation, clone character not found.";
-    end
-    
-    if mevreanim.animation.state.is_playing and mevreanim.animation.state.current_url == url then
-        API.stop_animation();
-        return;
-    end
-    
-    API.stop_animation();
-    
-    local clone_anim_controller = clone_char:FindFirstChildOfClass("Humanoid") or clone_char:FindFirstChildOfClass("AnimationController")
-    if clone_anim_controller then
-        for _, track in ipairs(clone_anim_controller:GetPlayingAnimationTracks()) do
-            track:Stop()
-        end
-    end
-    local clone_animate_script = clone_char:FindFirstChild("Animate")
-    if clone_animate_script then
-        clone_animate_script.Enabled = false
-    end
-    
-    local anim = mevreanim.animation;
-    anim.state.speed = tonumber(speed) or 1.0;
-
-    local keyframe_data = anim.cache[url];
-    if not keyframe_data then
-        local success, response = pcall(game.HttpGet, game, url);
-		if not success then return "Animation Error: Failed to fetch URL." end
-
-        local loaded_fn, err = loadstring(response);
-		if not loaded_fn then return "Animation Error: Invalid script from URL. " .. tostring(err) end;
-        
-		local success, data = pcall(loaded_fn)
-		if not success then return "Animation Error: Script from URL failed to execute. " .. tostring(data) end
-        keyframe_data = data;
-
-        if typeof(keyframe_data) ~= "table" then return "Animation Error: Script from URL did not return a table." end;
-        
-        anim.cache[url] = keyframe_data;
-    end
-
-    local keyframes = keyframe_data[next(keyframe_data)];
-	if not keyframes or #keyframes == 0 then
-		return "No keyframes array found for animation URL: " .. url;
-	end
-
-    anim.state.keyframes = keyframes;
-
-    table.clear(anim.joints);
-    table.clear(anim.original_motor_c0s);
-    for _, descendant in ipairs(clone_char:GetDescendants()) do
-        if descendant:IsA("Motor6D") then
-            anim.joints[descendant.Part1.Name] = descendant;
-            anim.original_motor_c0s[descendant] = descendant.C0;
-        end
-    end
-
-    anim.state.is_playing = true;
-    anim.state.current_url = url;
-    anim.state.total_duration = keyframes[#keyframes].Time;
-	if anim.state.total_duration <= 0 then API.stop_animation(); return end;
-	
-	anim.state.elapsed_time = 0;
-	
-	if mevreanim.callbacks.on_play then
-		pcall(mevreanim.callbacks.on_play, anim.state.current_url)
-	end
-	
-	mevreanim.connections.animation_hb = mevreanim.services.run_service.Heartbeat:Connect(function(deltaTime)
-		if not anim.state.is_playing then return end;
-		
-		anim.state.elapsed_time = (anim.state.elapsed_time + (deltaTime * anim.state.speed)) % anim.state.total_duration;
-		
-		local current_frame, next_frame;
-		for i = 1, #anim.state.keyframes - 1 do
-			if anim.state.elapsed_time >= anim.state.keyframes[i].Time and anim.state.elapsed_time < anim.state.keyframes[i+1].Time then
-				current_frame = anim.state.keyframes[i];
-				next_frame = anim.state.keyframes[i+1];
-				break;
-			end
-		end
-		if not current_frame then
-			current_frame = anim.state.keyframes[#anim.state.keyframes];
-			next_frame = anim.state.keyframes[1];
-		end
-		
-		local frame_duration = next_frame.Time - current_frame.Time;
-		if frame_duration <= 0 then frame_duration = anim.state.total_duration end;
-
-		local alpha = (frame_duration > 0) and (anim.state.elapsed_time - current_frame.Time) / frame_duration or 0;
-		alpha = math.clamp(alpha, 0, 1)
-
-		for partName, pose_cframe in pairs(current_frame.Data) do
-            local motor = anim.joints[partName];
-            if motor and anim.original_motor_c0s[motor] then
-                local original_c0 = anim.original_motor_c0s[motor];
-                local next_pose_cframe = next_frame.Data and next_frame.Data[partName];
-
-                if next_pose_cframe then
-                    motor.C0 = original_c0 * pose_cframe:Lerp(next_pose_cframe, alpha);
-                else
-                    motor.C0 = original_c0 * pose_cframe;
-                end
-            end
-		end
-	end);
-end;
-
---- Sets the playback speed for any currently playing animation.
--- @param speed (number) - The new playback speed multiplier.
-API.set_animation_speed = function(speed)
-    mevreanim.animation.state.speed = tonumber(speed) or 1.0;
-end;
-
---- Registers a callback function to be called when an animation starts playing.
--- @param callback (function) - The function to call. It receives the animation URL as an argument.
-API.on_animation_play = function(callback)
-	if type(callback) == "function" then
-		mevreanim.callbacks.on_play = callback
-	end
-end
-
---- Registers a callback function to be called when an animation stops.
--- @param callback (function) - The function to call. It receives the animation URL that was stopped.
-API.on_animation_stop = function(callback)
-	if type(callback) == "function" then
-		mevreanim.callbacks.on_stop = callback
-	end
-end
-
---- Returns the current animation playback state.
--- @return boolean, string | nil - is_playing, current_url
-API.is_animation_playing = function()
-	return mevreanim.animation.state.is_playing, mevreanim.animation.state.current_url
-end
-
---- Returns true if the local player is currently reanimated.
--- @return boolean
-API.is_reanimated = function()
-	return mevreanim.flags.reanimated;
-end;
-
---- Gets the active clone character model for a player.
--- @param player (Player) [optional] - The player to get the clone of. Defaults to LocalPlayer.
--- @return Model | nil
-API.get_clone = function(player)
-	player = player or get_local_player();
-	if typeof(player) == "string" then return nil end;
-	return mevreanim.clones[player];
-end;
-
---- Gets the real character model for a player.
--- @param player (Player) [optional] - The player to get the real character of. Defaults to LocalPlayer.
--- @return Model | nil
-API.get_real_character = function(player)
-	player = player or get_local_player();
-	if typeof(player) == "string" then return nil end;
-	return mevreanim.real_chars[player];
 end;
 
 return API;
